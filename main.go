@@ -1,15 +1,21 @@
 package googlesearch
 
 import (
+	"errors"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
-	"golang.org/x/net/html"
+	"github.com/PuerkitoBio/goquery"
+	"github.com/corpix/uarand"
 )
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
 
 type SearchResult struct {
 	URL         string
@@ -17,321 +23,179 @@ type SearchResult struct {
 	Description string
 }
 
-type SearchOptions struct {
-	Language      string        // language code (default: "en")
-	Region        string        // region code (default: "")
-	SafeSearch    string        // safe search setting: "active", "off" (default: "active")
-	Start         int           // starting result number (default: 0)
-	SleepInterval time.Duration // delay between requests (default: 0)
-	Timeout       time.Duration // request timeout (default: 10s)
-	UserAgent     string        // custom user agent (default: random)
-	Proxy         string        // proxy URL (default: "")
-	Unique        bool          // filter duplicate URLs (default: false)
+func (sr SearchResult) String() string {
+	return fmt.Sprintf("SearchResult(url=%s, title=%s, description=%s)", sr.URL, sr.Title, sr.Description)
 }
 
-func DefaultOptions() *SearchOptions {
-	return &SearchOptions{
-		Language:      "en",
-		Region:        "",
-		SafeSearch:    "active",
-		Start:         0,
-		SleepInterval: 0,
-		Timeout:       10 * time.Second,
-		UserAgent:     getUserAgent(),
-		Proxy:         "",
-		Unique:        false,
-	}
+
+func GetCustomUserAgent() string {
+	lynx := fmt.Sprintf("Lynx/%d.%d.%d", 
+		rand.Intn(2)+2,
+		rand.Intn(2)+8,
+		rand.Intn(3))
+	
+	libwww := fmt.Sprintf("libwww-FM/%d.%d", 
+		rand.Intn(2)+2,
+		rand.Intn(3)+13)
+	
+	sslmm := fmt.Sprintf("SSL-MM/%d.%d", 
+		rand.Intn(2)+1,
+		rand.Intn(3)+3)
+	
+	openssl := fmt.Sprintf("OpenSSL/%d.%d.%d", 
+		rand.Intn(3)+1,
+		rand.Intn(5),
+		rand.Intn(10))
+	
+	return fmt.Sprintf("%s %s %s %s", lynx, libwww, sslmm, openssl)
 }
 
-func Search(query string, numResults int, opts ...*SearchOptions) ([]string, error) {
-	var results []string
-	for result := range SearchChan(query, numResults, opts...) {
-		if result.Error != nil {
-			return results, result.Error
-		}
-		results = append(results, result.URL)
-	}
-	return results, nil
+func getRandomUserAgent() string {
+	return uarand.GetRandom()
 }
 
-func SearchAdvanced(query string, numResults int, opts ...*SearchOptions) ([]SearchResult, error) {
-	var results []SearchResult
-	for result := range SearchAdvancedChan(query, numResults, opts...) {
-		if result.Error != nil {
-			return results, result.Error
-		}
-		results = append(results, SearchResult{
-			URL:         result.URL,
-			Title:       result.Title,
-			Description: result.Description,
-		})
-	}
-	return results, nil
-}
-
-type SearchResponse struct {
-	URL         string
-	Title       string
-	Description string
-	Error       error
-}
-
-func SearchChan(query string, numResults int, opts ...*SearchOptions) <-chan SearchResponse {
-	ch := make(chan SearchResponse)
-	go func() {
-		defer close(ch)
-		for result := range SearchAdvancedChan(query, numResults, opts...) {
-			ch <- SearchResponse{
-				URL:   result.URL,
-				Error: result.Error,
-			}
-		}
-	}()
-	return ch
-}
-
-func SearchAdvancedChan(query string, numResults int, opts ...*SearchOptions) <-chan SearchResponse {
-	ch := make(chan SearchResponse)
-	
-	go func() {
-		defer close(ch)
-		
-		var options *SearchOptions
-		if len(opts) > 0 && opts[0] != nil {
-			options = opts[0]
-		} else {
-			options = DefaultOptions()
-		}
-		
-		client := &http.Client{
-			Timeout: options.Timeout,
-		}
-		
-		if options.Proxy != "" {
-			proxyURL, err := url.Parse(options.Proxy)
-			if err == nil {
-				client.Transport = &http.Transport{
-					Proxy: http.ProxyURL(proxyURL),
-				}
-			}
-		}
-		
-		start := options.Start
-		fetchedResults := 0
-		fetchedLinks := make(map[string]bool)
-		
-		for fetchedResults < numResults {
-			resp, err := makeRequest(client, query, numResults-start, options.Language, 
-				start, options.SafeSearch, options.Region, options.UserAgent)
-			if err != nil {
-				ch <- SearchResponse{Error: err}
-				return
-			}
-			
-			results, err := parseResults(resp)
-			if err != nil {
-				ch <- SearchResponse{Error: err}
-				return
-			}
-			
-			newResults := 0
-			for _, result := range results {
-				if options.Unique && fetchedLinks[result.URL] {
-					continue
-				}
-				
-				fetchedLinks[result.URL] = true
-				fetchedResults++
-				newResults++
-				
-				ch <- SearchResponse{
-					URL:         result.URL,
-					Title:       result.Title,
-					Description: result.Description,
-				}
-				
-				if fetchedResults >= numResults {
-					break
-				}
-			}
-			
-			if newResults == 0 {
-				break
-			}
-			
-			start += 10
-			if options.SleepInterval > 0 {
-				time.Sleep(options.SleepInterval)
-			}
-		}
-	}()
-	
-	return ch
-}
-
-func makeRequest(client *http.Client, query string, numResults int, lang string, start int, safe string, region string, userAgent string) (string, error) {
-	params := url.Values{
-		"q":     {query},
-		"num":   {strconv.Itoa(numResults + 2)},
-		"hl":    {lang},
-		"start": {strconv.Itoa(start)},
-		"safe":  {safe},
-	}
-	
-	if region != "" {
-		params.Set("gl", region)
-	}
-	
-	req, err := http.NewRequest("GET", "https://www.google.com/search?"+params.Encode(), nil)
-	if err != nil {
-		return "", err
-	}
-	
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "*/*")
-	
-	req.AddCookie(&http.Cookie{Name: "CONSENT", Value: "PENDING+987"})
-	req.AddCookie(&http.Cookie{Name: "SOCS", Value: "CAESHAgBEhIaAB"})
-	
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	
-	doc, err := html.Parse(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	
-	return nodeToString(doc), nil
-}
-
-func parseResults(htmlContent string) ([]SearchResult, error) {
-	doc, err := html.Parse(strings.NewReader(htmlContent))
+func sendRequest(term string, results int, lang string, start int, client *http.Client, region, safe string, sslVerify bool) (*http.Response, error) {
+	baseURL := "https://www.google.com/search"
+	req, err := http.NewRequest("GET", baseURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	
-	var results []SearchResult
-	var traverse func(*html.Node)
-	
-	traverse = func(n *html.Node) {
-		if n.Type == html.ElementNode && n.Data == "div" {
-			if hasClass(n, "ezO2md") {
-				result := extractResult(n)
-				if result.URL != "" {
-					results = append(results, result)
-				}
-			}
+
+	q := req.URL.Query()
+	q.Add("q", term)
+	q.Add("num", fmt.Sprintf("%d", results+2))
+	q.Add("hl", lang)
+	q.Add("start", fmt.Sprintf("%d", start))
+	q.Add("safe", safe)
+	if region != "" {
+		q.Add("gl", region)
+	}
+	req.URL.RawQuery = q.Encode()
+
+	req.Header.Set("User-Agent", getRandomUserAgent())
+	req.Header.Set("Accept", "*/*")
+
+	req.AddCookie(&http.Cookie{Name: "CONSENT", Value: "PENDING+987"})
+	req.AddCookie(&http.Cookie{Name: "SOCS", Value: "CAESHAgBEhIaAB"})
+
+	return client.Do(req)
+}
+
+func Search(
+	term string,
+	numResults int,
+	lang string,
+	proxy string,
+	advanced bool,
+	sleepInterval int,
+	timeout int,
+	safe string,
+	sslVerify bool,
+	region string,
+	startNum int,
+	unique bool,
+) ([]interface{}, error) {
+	client := &http.Client{
+		Timeout: time.Duration(timeout) * time.Second,
+	}
+
+	if proxy != "" {
+		proxyURL, err := url.Parse(proxy)
+		if err != nil {
+			return nil, err
 		}
-		
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			traverse(c)
+		client.Transport = &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
 		}
 	}
-	
-	traverse(doc)
+
+	if !sslVerify {
+		client.Transport = &http.Transport{
+			Proxy:           client.Transport.(*http.Transport).Proxy,
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
+
+	if safe == "" {
+		safe = "active"
+	}
+
+	start := startNum
+	fetchedResults := 0
+	fetchedLinks := make(map[string]bool)
+	var results []interface{}
+
+	for fetchedResults < numResults {
+		resp, err := sendRequest(term, numResults, lang, start, client, region, safe, sslVerify)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			return nil, fmt.Errorf("google: received non-200 status code: %d", resp.StatusCode)
+		}
+
+		doc, err := goquery.NewDocumentFromReader(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		newResults := 0
+		doc.Find("div.ezO2md").Each(func(i int, s *goquery.Selection) {
+			if fetchedResults >= numResults {
+				return
+			}
+
+			linkTag := s.Find("a[href]").First()
+			href, exists := linkTag.Attr("href")
+			if !exists {
+				return
+			}
+
+			if !strings.HasPrefix(href, "/url?q=") {
+				return
+			}
+			link := strings.TrimPrefix(href, "/url?q=")
+			if idx := strings.Index(link, "&"); idx != -1 {
+				link = link[:idx]
+			}
+			decodedLink, err := url.QueryUnescape(link)
+			if err != nil || decodedLink == "" {
+				return
+			}
+
+			if unique && fetchedLinks[decodedLink] {
+				return
+			}
+			fetchedLinks[decodedLink] = true
+
+			title := linkTag.Find("span.CVA68e").First().Text()
+			description := s.Find("span.FrIlee").First().Text()
+
+			if advanced {
+				results = append(results, SearchResult{
+					URL:         decodedLink,
+					Title:       title,
+					Description: description,
+				})
+			} else {
+				results = append(results, decodedLink)
+			}
+
+			fetchedResults++
+			newResults++
+		})
+
+		if newResults == 0 {
+			break
+		}
+
+		start += 10
+		if sleepInterval > 0 {
+			time.Sleep(time.Duration(sleepInterval) * time.Second)
+		}
+	}
+
 	return results, nil
-}
-
-func extractResult(node *html.Node) SearchResult {
-	var result SearchResult
-	var traverse func(*html.Node)
-	
-	traverse = func(n *html.Node) {
-		if n.Type == html.ElementNode {
-			switch n.Data {
-			case "a":
-				if result.URL == "" {
-					href := getAttr(n, "href")
-					if href != "" && strings.HasPrefix(href, "/url?q=") {
-						// Decode Google redirect URL
-						parts := strings.Split(href, "&")
-						if len(parts) > 0 {
-							urlPart := strings.TrimPrefix(parts[0], "/url?q=")
-							decoded, err := url.QueryUnescape(urlPart)
-							if err == nil {
-								result.URL = decoded
-							}
-						}
-					}
-				}
-			case "span":
-				if hasClass(n, "CVA68e") && result.Title == "" {
-					result.Title = getTextContent(n)
-				} else if hasClass(n, "FrIlee") && result.Description == "" {
-					result.Description = getTextContent(n)
-				}
-			}
-		}
-		
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			traverse(c)
-		}
-	}
-	
-	traverse(node)
-	return result
-}
-
-func hasClass(node *html.Node, className string) bool {
-	for _, attr := range node.Attr {
-		if attr.Key == "class" {
-			classes := strings.Fields(attr.Val)
-			for _, class := range classes {
-				if class == className {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-func getAttr(node *html.Node, name string) string {
-	for _, attr := range node.Attr {
-		if attr.Key == name {
-			return attr.Val
-		}
-	}
-	return ""
-}
-
-func getTextContent(node *html.Node) string {
-	var text strings.Builder
-	var traverse func(*html.Node)
-	
-	traverse = func(n *html.Node) {
-		if n.Type == html.TextNode {
-			text.WriteString(n.Data)
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			traverse(c)
-		}
-	}
-	
-	traverse(node)
-	return strings.TrimSpace(text.String())
-}
-
-func nodeToString(node *html.Node) string {
-	var buf strings.Builder
-	html.Render(&buf, node)
-	return buf.String()
-}
-
-func getUserAgent() string {
-	userAgents := []string{
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:89.0) Gecko/20100101 Firefox/89.0",
-	}
-	return userAgents[time.Now().Unix()%int64(len(userAgents))]
 }
